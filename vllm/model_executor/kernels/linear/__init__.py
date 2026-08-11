@@ -60,6 +60,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.triton_w8a16_gemv import (
+    TritonW8A16GemvLinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
     XPUW4A8IntLinearKernel,
     XPUwNa16LinearKernel,
@@ -358,6 +361,9 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
 # in priority/performance order (when available)
 _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        # Opt-in (VLLM_W8A16_TRITON_GEMV=1); sm75 decode GEMV where
+        # Marlin is slower than fp16
+        TritonW8A16GemvLinearKernel,
         CutlassW4A8LinearKernel,
         MacheteLinearKernel,
         AllSparkLinearKernel,

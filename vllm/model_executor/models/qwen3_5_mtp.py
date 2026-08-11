@@ -457,7 +457,17 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
+        loaded = loader.load_weights(remap_weight_names(weights))
+
+        # Experimental, off by default (VLLM_DRAFT_LMHEAD_W8A16=1): quantize the
+        # draft lm_head in place. Only affects draft acceptance rate, never
+        # output correctness (rejection sampling).
+        from vllm.model_executor.layers.draft_w8a16_lmhead import (
+            maybe_quantize_draft_lmhead,
+        )
+
+        maybe_quantize_draft_lmhead(self.lm_head)
+        return loaded
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):

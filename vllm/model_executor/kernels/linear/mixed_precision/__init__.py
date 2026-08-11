@@ -35,6 +35,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.triton_w8a16_gemv import (
+    TritonW8A16GemvLinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
     XPUW4A8IntLinearKernel,
     XPUwNa16LinearKernel,
@@ -56,6 +59,7 @@ __all__ = [
     "MarlinLinearKernel",
     "RDNA3W4A16LinearKernel",
     "TritonW4A16LinearKernel",
+    "TritonW8A16GemvLinearKernel",
     "XPUW4A8IntLinearKernel",
     "XPUwNa16LinearKernel",
     "ZentorchWNA16LinearKernel",
