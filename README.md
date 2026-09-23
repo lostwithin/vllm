@@ -1,181 +1,268 @@
-# vLLM-Turing-W8A16：面向 NVIDIA T4 的低批量解码优化实践
+# vLLM-Turing-W8A16: Low-Batch Decode Optimization for NVIDIA T4
 
-基于 vLLM 二次开发，面向 Turing（sm75，如 NVIDIA T4）实现 W8A16 Triton GEMV 内核。在已记录的 T4、Qwen3.5-9B Linear 形状测试中，M=1/2/4 时相对 cuBLAS FP16 的算子加速比分别为 **2.14× / 1.91× / 1.13×**。
+Based on **vLLM v0.28.0**, this project implements a W8A16 Triton GEMV kernel that fuses dequantization and multiply-accumulate operations for Turing GPUs (sm75, such as NVIDIA T4). With **qwen3.5-9B-w8a16**, end-to-end A/B testing shows an approximately **10% improvement in decode throughput**. In recorded T4 tests using qwen3.5-9B-w8a16 Linear shapes, operator speedups over cuBLAS FP16 were **2.14× / 1.91× / 1.13×** for M=1/2/4.
 
-> 当前结果为算子级测试，不代表端到端吞吐或 TTFT 收益。上游 vLLM 版本、项目地址及完整测试环境尚需补充，不能直接标注为 v0.6.x。
+Repository: [lostwithin/vllm](https://github.com/lostwithin/vllm)
 
-## 1. 背景与问题
+## 1. Background and Problem
 
-大模型逐 token 解码时，Linear 层通常只处理少量 token。此时权重读取开销较突出，计算容易受到显存带宽限制。W8A16 使用 INT8 权重与 FP16 激活，相比 FP16 权重可减少约一半的**权重数据读取量**，但实际收益取决于反量化、访存和归约的实现。
+During token-by-token decoding, Linear layers typically process only a small number of tokens. Weight reads become a significant cost, and execution is often limited by GPU memory bandwidth. W8A16 uses INT8 weights and FP16 activations, reducing **weight data traffic** by roughly half compared with FP16 weights. Actual gains still depend on the implementation of dequantization, memory accesses, and reductions.
 
-T4 属于 Turing 架构，不支持 Ampere 引入的 `cp.async`。面向新架构优化的内核未必适合它；同时，INT8 Tensor Core 也不能直接执行 INT8 权重与 FP16 激活的混合乘法。因此，本项目针对 **M≤8 的小批量解码**，实现融合反量化与乘加的 Triton GEMV，通过权重复用、向量化访存和延后归约降低开销。
+T4 uses the Turing architecture and does not support `cp.async`, introduced with Ampere. Kernels optimized for newer architectures may therefore be unsuitable for T4. INT8 Tensor Cores also cannot directly multiply INT8 weights by FP16 activations. This project targets **small-batch decode with M≤8**, using a bandwidth-oriented Triton GEMV that reduces overhead through weight reuse, vectorized memory access, and delayed reduction.
+
+M denotes the number of tokens processed by the current Linear call, which is not necessarily the number of concurrent requests.
 
 ```mermaid
 flowchart LR
-    A[INT8 权重 + FP16 激活] --> B{本次 Linear 输入 token 数}
-    B -->|M ≤ 8| C[融合反量化与 GEMV]
-    C --> D[复用权重并完成归约]
-    B -->|M > 8| E[反量化为 FP16]
-    E --> F[cuBLAS 矩阵乘法]
-    D --> G[FP16 输出]
+    A[INT8 weights and FP16 activations] --> B{Tokens in current Linear call}
+    B -->|M ≤ 8| C[Triton fused dequantization and GEMV]
+    C --> D[Reuse weights and perform reduction]
+    B -->|M > 8| E[Dequantize weights to FP16]
+    E --> F[cuBLAS matrix multiplication]
+    D --> G[FP16 output]
     F --> G
 ```
 
-## 2. 我的改动
+## 2. Changes
 
-### 模块 A：面向小批量解码的 Triton GEMV
+### Module A: Triton GEMV for Small-Batch Decode
 
-实现 `TritonW8A16GemvLinearKernel`，将小 M 场景下的计算组织为带宽导向的 GEMV：
+`TritonW8A16GemvLinearKernel` organizes small-M workloads as bandwidth-oriented GEMV:
 
-- **每个 program 处理一个输出通道**：同一行 INT8 权重在 program 内供多行激活复用，减少重复读取。
-- **融合反量化与乘加**：小批量路径不生成完整的 FP16 权重临时张量。
-- **将归约移到 K 循环之外**：循环内使用 FP32 累加器，结束后统一归约，减少循环内归约带来的延迟。
-- **减少带 mask 的访存**：host 侧将 M 补齐到 2 的幂，并选择能够整除 K 的 `BLOCK_K`，为向量化访存创造条件。
+- **One program per output channel:** with `grid = (N,)`, the same INT8 weight row is reused across multiple activation rows within a program, reducing repeated reads.
+- **Fused dequantization and multiply-accumulate:** the small-batch path does not materialize a full temporary FP16 weight tensor; dequantized values are used directly in computation.
+- **Reduction outside the K loop:** a `[BLOCK_M, BLOCK_K]` FP32 accumulator is maintained inside the loop, followed by `tl.sum(axis=1)` after the loop to reduce repeated reduction latency.
+- **Fewer masked memory accesses:** the host pads the input and output buffers to `BLOCK_M = next_power_of_2(M)` rows and selects a `BLOCK_K` that divides K, enabling vectorized memory access.
+- **Reuse of dequantized values:** dequantization and accumulation use FP32. The result of `w * s` is broadcast across multiple activation rows, while `tl.multiple_of` and `tl.max_contiguous` guide compiler memory optimizations.
 
-`BLOCK_K` 从 1024、512、256、128 中按规则选择，`num_warps` 固定为 4。该方案优先服务 T4 小批量解码，尚未引入 autotune。
+`BLOCK_K` is the first value in 1024, 512, 256, and 128 that divides K. `num_warps` is fixed at 4. There is currently no autotuning; the implementation prioritizes small-batch decode on T4.
 
-核心文件：[`triton_w8a16_gemv.py`](./vllm/model_executor/kernels/linear/mixed_precision/triton_w8a16_gemv.py)
+Core file: [`triton_w8a16_gemv.py`](https://github.com/lostwithin/vllm/blob/HEAD/vllm/model_executor/kernels/linear/mixed_precision/triton_w8a16_gemv.py)
 
-### 模块 B：权重布局转换与加载显存控制
+### Module B: Weight Layout Conversion and Loading Memory Control
 
-模型加载后，将 compressed-tensors 的打包权重转换为 K 方向连续的 INT8 布局：
+`process_weights_after_loading()` converts compressed-tensors packed weights once into an INT8 layout contiguous along K:
 
 ```text
-加载格式：
-weight_packed [N, K/4]  INT32
+Checkpoint format:
+weight_packed [N, K/4]   INT32
 weight_scale  [N, K/128] FP16
 
-运行格式：
-weight_packed [N, K]    INT8
-weight_scale  [N, K/128] FP16
+             ↓ Unpack in chunks and recover signed values
+
+Runtime format:
+weight_packed [N, K]     INT8, row-major, contiguous along K
+weight_scale  [N, K/128] FP16, contiguous
 ```
 
-按每块 8192 行分批解包，避免一次性展开产生过大的 INT32 中间张量。转换发生在加载阶段，推理时直接使用转换后的布局。
+Each INT32 in the checkpoint stores four weight bytes, encoded as “signed value + 128”. Unpacking processes 8192 rows per chunk to avoid excessively large INT32 intermediate tensors and reduce peak GPU memory usage during model loading.
 
-### 模块 C：可选启用、内核选择与大批量回退
+Conversion occurs during loading. Inference directly uses the converted layout.
 
-通过 `VLLM_W8A16_TRITON_GEMV=1` 显式启用，默认关闭。只有量化配置匹配时才参与内核选择；不满足条件的层继续选择后续候选内核。
+### Module C: Opt-In Selection and Large-Batch Fallback
 
-对于已选中本实现的层：
+The kernel is disabled by default and explicitly enabled with `VLLM_W8A16_TRITON_GEMV=1`. It is eligible for selection only when the configuration passes `can_implement()`; unsupported layers continue to subsequent kernel candidates.
 
-| 场景 | 执行路径 | 设计取舍 |
-|---|---|---|
-| M≤8 | Triton 融合 GEMV | 优先降低权重读取与反量化开销 |
-| M>8 | 反量化后调用 cuBLAS FP16 | 使用成熟的矩阵乘法实现，但每次调用会产生 FP16 权重临时张量 |
+For layers that select this implementation:
 
-相关文件：
+| Workload | Execution path                         | Trade-off                                                    |
+| -------- | -------------------------------------- | ------------------------------------------------------------ |
+| M≤8      | Fused Triton GEMV                      | Prioritizes reducing weight reads, dequantization, and reduction overhead |
+| M>8      | Dequantization followed by cuBLAS FP16 | Uses a mature matrix multiplication implementation, but materializes a full temporary FP16 weight tensor per call |
 
-- [`linear/__init__.py`](./vllm/model_executor/kernels/linear/__init__.py)：注册内核选择优先级。
-- [`mixed_precision/__init__.py`](./vllm/model_executor/kernels/linear/mixed_precision/__init__.py)：导出内核类。
+Related files:
 
-**当前硬件判断存在边界问题：**能力下限设为 sm75，且内核排在候选列表首位，因此开启后也可能在 A100/H100 等更新 GPU 上抢占其他实现。目前应仅在目标 T4/Turing 环境启用。
+- [`linear/__init__.py`](https://github.com/lostwithin/vllm/blob/HEAD/vllm/model_executor/kernels/linear/__init__.py): inserts this kernel at the front of the CUDA candidate list.
+- [`mixed_precision/__init__.py`](https://github.com/lostwithin/vllm/blob/HEAD/vllm/model_executor/kernels/linear/mixed_precision/__init__.py): exports `TritonW8A16GemvLinearKernel`.
 
-### 模块 D：编译流程适配
+**Current hardware selection caveat:** `get_min_capability()` returns 75. Once enabled, this kernel may also take priority on sm75+ GPUs such as A100/H100 if the configuration matches. It is intended for T4/Turing and is currently not recommended for Ampere or newer architectures.
 
-通过 `direct_register_custom_op("w8a16_triton_gemv", ...)` 注册 opaque custom op，并提供 `fake_impl`。
+### Module D: Compilation Integration
 
-这样可避免 Inductor 深入追踪反量化表达式，减少原记录中 sm75 编译阶段组合内核 benchmark 引发的长时间等待。
+The operation is registered as an opaque custom op using `direct_register_custom_op("w8a16_triton_gemv", ...)`, with a `fake_impl`.
 
-## 3. Benchmark 结果
+This prevents Inductor from tracing into the dequantization expression, avoiding the long compilation delays attributed to combo-kernel benchmarking on sm75 in the original records.
 
-### 硬件与测试范围
+### Scope of Related Implementations
 
-以下结果整理自原文引用的源码 docstring，未在本次改写中重新测试。
+The repository also includes [`draft_w8a16_lmhead.py`](https://github.com/lostwithin/vllm/blob/HEAD/vllm/model_executor/layers/draft_w8a16_lmhead.py), which applies W8A16 quantization to the speculative drafter's FP16 `lm_head` after loading. It is enabled with `VLLM_DRAFT_LMHEAD_W8A16=1` and integrated through [`qwen3_5_mtp.py`](https://github.com/lostwithin/vllm/blob/HEAD/vllm/model_executor/models/qwen3_5_mtp.py).
 
-| 项目 | 配置 |
-|---|---|
-| GPU | NVIDIA T4，sm75 |
-| 测试对象 | Qwen3.5-9B 的 Linear 形状 |
-| 权重 / 激活 | INT8 / FP16 |
-| group_size | 128 |
-| 基线 | cuBLAS FP16 |
-| 测量范围 | Linear 算子级性能 |
-| 待补充信息 | 软件版本、完整形状列表、计时脚本、预热与重复次数、结果聚合方式 |
+This is independent of the kernel described here. This kernel handles weights already quantized in the checkpoint through MPLinearKernel selection; the drafter `lm_head` implementation replaces `quant_method`. The performance tables below do not include gains from that independent feature.
 
-M 表示**当前 Linear 调用处理的 token 数**，不一定等于请求并发数。
+## 3. Benchmark Results
 
-### 性能对比
+### Hardware and Test Scope
 
-以 cuBLAS FP16 的执行速度为 1.00×：
+The following table lists the end-to-end A/B test configuration provided by the project author. Operator-level results are listed separately and come from the source docstring; the two-GPU end-to-end configuration should not be interpreted as the operator benchmark configuration. Tests were not rerun while preparing this document.
 
-| M | cuBLAS FP16 | 本项目 Triton GEMV |
-|---:|---:|---:|
-| 1 | 1.00× | **2.14×** |
-| 2 | 1.00× | **1.91×** |
-| 4 | 1.00× | **1.13×** |
+| Item                             | Configuration                                                |
+| -------------------------------- | ------------------------------------------------------------ |
+| GPUs                             | 2× NVIDIA Tesla T4 (GPU 4 and GPU 5), sm75                   |
+| Tensor parallelism               | TP=2                                                         |
+| Model                            | `qwen3.5-9B-w8a16`                                           |
+| Weights / activations            | INT8 / FP16                                                  |
+| group_size                       | 128                                                          |
+| vLLM runtime parameters          | `gpu_memory_utilization=0.90`, `max_model_len=4096`, `max_num_seqs=64` |
+| CUDA Graph                       | Enabled, `cudagraph_capture_sizes=[1,2,4,8]`                 |
+| All-Reduce                       | `disable_custom_all_reduce=True`                             |
+| Attention                        | `TRITON_ATTN`                                                |
+| MTP                              | Draft 3 tokens per step                                      |
+| Workload                         | The same single Chinese prompt, one request                  |
+| Sampling                         | Thinking disabled, greedy sampling, exactly 256 generated tokens |
+| Warm-up and repetitions          | 8-token warm-up, 3 measured repetitions                      |
+| Measured metric                  | Single-request decode throughput                             |
+| vLLM version                     | v0.28.0                                                      |
+| Base commit                      | [`311ad689adcde0236d630ca202110f5b0fec85f8`](https://github.com/lostwithin/vllm/commit/311ad689adcde0236d630ca202110f5b0fec85f8) |
+| W8A16 GEMV optimization commit   | [`a623df6408b8e82c9bf955220e8b4e7f93f25def`](https://github.com/lostwithin/vllm/commit/a623df6408b8e82c9bf955220e8b4e7f93f25def) |
+| Information still to be provided | Full shape list, timing script, aggregation method, and absolute throughput |
 
-收益随 M 增大而收窄。M>8 使用回退路径，目前不宣称存在加速收益。
+### Operator-Level Comparison
 
-原记录另报告同硬件上 Marlin 约为 cuBLAS FP16 的 0.94×；由于缺少对应版本、配置与执行路径记录，该结果仅作为背景参考。
+The following records use Qwen3.5-9B Linear shapes on T4 with group_size=128. cuBLAS FP16 performance is normalized to 1.00×:
 
-### 测试方法与控制变量
+| M (tokens in the current call) | cuBLAS FP16 | Triton GEMV |
+| -----------------------------: | ----------: | ----------: |
+|                              1 |       1.00× |   **2.14×** |
+|                              2 |       1.00× |   **1.91×** |
+|                              4 |       1.00× |   **1.13×** |
 
-完整复现应固定 GPU、软件版本、矩阵形状、输入数据、量化参数及计时方式，统一预热，并使用 CUDA Event 或正确同步后的 GPU 计时。算子测试应计入调用所需的 padding、反量化等开销，避免只比较内核主体。
+The gain narrows as M increases. M>8 uses the fallback path, for which no speedup is currently claimed.
 
-**“原版 vLLM vs 修改版”的端到端对比尚待补充。**该测试还需固定模型 checkpoint、输入与输出长度、并发数、调度配置和采样参数，报告吞吐、TTFT、TPOT 与峰值显存。当前不能用上述算子加速比替代这些指标。
+The original records also report Marlin at approximately 0.94× cuBLAS FP16 performance on the same hardware. Because the corresponding version, configuration, and execution path were not recorded, this is provided only as background rather than a general conclusion about upstream vLLM.
 
-## 4. 快速复现
+### Methodology and Controlled Variables
 
-> 以下为复现步骤框架。仓库地址、上游 commit、依赖版本和模型 ID 尚未提供；补齐并验证这些信息后，才能承诺 clone 后直接运行。
+The end-to-end A/B test fixes the following settings: 2× Tesla T4 (GPU 4 and GPU 5, TP=2), FP16 activations, `gpu_memory_utilization=0.90`, `max_model_len=4096`, `max_num_seqs=64`, CUDA Graph enabled with `cudagraph_capture_sizes=[1,2,4,8]`, `disable_custom_all_reduce=True`, `TRITON_ATTN`, and MTP drafting 3 tokens per step.
 
-### 4.1 环境搭建
+The test uses the same single Chinese prompt, disables thinking, applies greedy sampling, and forces generation of 256 tokens. An 8-token warm-up precedes 3 measured repetitions. Only **single-request decode throughput** was measured; no conclusions are drawn about TTFT, TPOT, concurrent throughput, or peak GPU memory usage.
 
-准备 NVIDIA T4 环境，克隆包含本内核的项目，并按项目锁定的依赖版本安装：
+Operator-level reproduction should also fix hardware, software versions, matrix shapes, inputs, quantization parameters, and timing methodology. Use consistent warm-up and CUDA Events or correctly synchronized GPU timing. Include padding and dequantization costs required by the call rather than comparing only the kernel body.
+
+Suggested steps for reproducing the end-to-end A/B result:
+
+1. Run the same model on GPU 4 and GPU 5 with TP=2, keeping all runtime settings fixed.
+2. Compare runs with the GEMV switch disabled and enabled through `VLLM_W8A16_TRITON_GEMV=1`, using identical prompts, sampling, and generation lengths.
+3. Warm up 8 tokens for each group, then run 3 single-request measurements.
+4. Record decode throughput for each 256-token generation and report the mean and relative change from the baseline.
+5. Separately test operator shapes with M=1/2/4/8/9 and larger M to check the optimized path and fallback boundary.
+
+### End-to-End Serving Performance
+
+According to the project author's A/B results, **single-request decode throughput improves by approximately 10%** under the fixed configuration above, reaching about **1.10×** the baseline. The test covers only single-request throughput; absolute throughput values in tokens/s have not yet been provided.
+
+| Metric                                        | Group A (baseline) | Group B (optimized) | Relative change |
+| --------------------------------------------- | -----------------: | ------------------: | --------------: |
+| Single-request decode throughput (normalized) |              1.00× |     **About 1.10×** |  **About +10%** |
+
+To reproduce this result, keep the model checkpoint, Chinese prompt, disabled thinking, greedy sampling, 256-token generation, 8-token warm-up, 3 repetitions, TP=2, MTP draft length, and runtime settings fixed. Specify precisely how decode throughput is calculated. The A/B groups differ only in the GEMV kernel switch; all other settings remain unchanged.
+
+## 4. Quick Reproduction
+
+### 4.1 Environment Setup
+
+Prepare an NVIDIA T4 environment and clone the project:
 
 ```bash
 git clone https://github.com/lostwithin/vllm.git
 cd vllm
 
-# 按该分支的构建说明安装匹配的 PyTorch、CUDA 与 Triton。
+# Check out a fixed commit containing GEMV; verify the actual A/B test commit against the original records.
+git checkout a623df6408b8e82c9bf955220e8b4e7f93f25def
+
+# Follow the build instructions to install compatible PyTorch, CUDA, and Triton versions.
 pip install -e .
 ```
 
-应在发布前明确记录 vLLM 基础 commit、Python、PyTorch、CUDA 和 Triton 版本。
+Version information confirmed in the repository:
 
-### 4.2 下载兼容模型
+- Base commit: [`311ad689adcde0236d630ca202110f5b0fec85f8`](https://github.com/lostwithin/vllm/commit/311ad689adcde0236d630ca202110f5b0fec85f8).
+- Optimization commit: [`a623df6408b8e82c9bf955220e8b4e7f93f25def`](https://github.com/lostwithin/vllm/commit/a623df6408b8e82c9bf955220e8b4e7f93f25def), with commit message `add gemv`.
+- Python: `>=3.10,<3.15`.
+- PyTorch: `==2.11.0` (project build constraint).
+- Build dependencies: `cmake>=3.26.1`, `ninja`, `packaging>=24.2`, `setuptools>=77.0.3,<81.0.0`, `setuptools-scm>=8`, `setuptools-rust>=1.9.0`, `wheel`, `jinja2>=3.1.6`, `regex`, and `build`.
+- protobuf: `>=5.29.6`, excluding `6.30.*`, `6.31.*`, `6.32.*`, and `6.33.0.*` through `6.33.4.*`.
 
-模型需采用受支持的 compressed-tensors W8A16 配置：
-
-| 配置项 | 要求 |
-|---|---|
-| 权重量化类型 | `scalar_types.uint8b128` |
-| 激活 dtype | `torch.float16` |
-| group_size | 128 |
-| zero points | 不支持 |
-| `g_idx` / act-order 重排 | 不支持 |
-| K 对齐 | TP 分片后的 K 必须能被 128 整除 |
-
-使用实际兼容的模型 ID 下载 checkpoint：
+These versions come from `pyproject.toml` and `requirements/build/cuda.txt` and represent installation constraints. Record the actual CUDA, Triton, NVIDIA driver, and other runtime package versions on the test machine separately:
 
 ```bash
-hf download <兼容的W8A16模型ID> --local-dir ./models/w8a16
+python --version
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+python -c "import triton; print(triton.__version__)"
+pip freeze > requirements-benchmark.txt
+nvidia-smi
 ```
 
-### 4.3 启动服务
+### 4.2 Download a Compatible Model
 
-以下命令适用于 Linux Bash：
+The model must use a supported compressed-tensors W8A16 configuration:
+
+| Setting                        | Requirement                                                  |
+| ------------------------------ | ------------------------------------------------------------ |
+| Platform                       | CUDA                                                         |
+| Current capability check       | ≥sm75; enable only on T4/Turing as recommended               |
+| Weight quantization type       | `scalar_types.uint8b128`, symmetric INT8 with storage bias 128 |
+| Activation dtype               | `torch.float16`                                              |
+| group_size                     | 128                                                          |
+| Zero points                    | Unsupported                                                  |
+| `g_idx` / act-order reordering | Unsupported                                                  |
+| K alignment                    | K after TP sharding must be divisible by 128                 |
+
+Replace the example model identifier with the verified compatible model ID before downloading:
+
+```bash
+hf download qwen3.5-9B-w8a16 --local-dir ./models/qwen3.5-9B-w8a16
+```
+
+### 4.3 Start the Service
+
+The following example enables the feature. To reproduce the approximately 10% throughput improvement, also apply the full test configuration listed later in this section.
 
 ```bash
 VLLM_W8A16_TRITON_GEMV=1 \
-vllm serve ./models/w8a16 --dtype float16
+vllm serve ./models/qwen3.5-9B-w8a16 --dtype float16
 ```
 
-生效后，应出现日志：
+When active, the log should contain:
 
 ```text
 TritonW8A16GemvLinearKernel active (sm75 W8A16 GEMV)
 ```
 
-该环境变量在 layer 构造阶段读取，必须在引擎启动前设置。关闭时移除该变量并重启服务，或通过以下配置排除内核：
+This environment variable is not registered in `vllm/envs.py`; `can_implement()` reads it directly through `os.environ`. It takes effect during layer construction and must therefore be set before engine startup.
+
+To disable the kernel, unset the variable and restart the service, or explicitly exclude it:
 
 ```bash
 VLLM_DISABLED_KERNELS=TritonW8A16GemvLinearKernel \
-vllm serve ./models/w8a16 --dtype float16
+vllm serve ./models/qwen3.5-9B-w8a16 --dtype float16
 ```
 
-### 4.4 数值验证
+#### End-to-End A/B Test Parameters
 
-以下示例直接调用底层函数，不需要启动服务：
+Set `CUDA_VISIBLE_DEVICES=4,5` before starting the test process. Both groups use the following engine configuration:
+
+```text
+model = Local path to the qwen3.5-9B-w8a16 checkpoint
+tensor_parallel_size = 2
+dtype = float16
+gpu_memory_utilization = 0.90
+max_model_len = 4096
+max_num_seqs = 64
+CUDA Graph = Enabled
+cudagraph_capture_sizes = [1, 2, 4, 8]
+disable_custom_all_reduce = True
+attention backend = TRITON_ATTN
+speculative method = MTP
+num_speculative_tokens = 3
+```
+
+This is a configuration record; refer to the test script for the exact CLI or Python syntax. The client uses the same Chinese prompt, disables thinking, uses greedy sampling, and forces generation of 256 tokens. Warm up 8 tokens, then run 3 measured single-request tests. `max_num_seqs=64` is an engine capacity setting and does not mean the test used 64 concurrent requests.
+
+The reproduction record still needs the original prompt, absolute throughput from all three runs, the aggregation method, and whether decode timing excludes prefill/the first token. Total elapsed time alone cannot determine decode throughput excluding prefill.
+
+### 4.4 Numerical Validation
+
+The following example calls the underlying function directly without starting a service. Save it as `check_w8a16_gemv.py` and run it:
 
 ```python
 import torch
@@ -208,39 +295,45 @@ print("max abs err:", error.abs().max().item())
 print("rel err:", (error.norm() / ref.norm()).item())
 ```
 
-该脚本用于观察误差，尚未定义通过阈值。正式测试需要覆盖不同 M、N、K，以及 M=8/9 的路径切换边界。
-
-## 5. 局限与后续计划
-
-- **适用范围较窄。**当前仅支持 `uint8b128`、FP16 激活、`group_size=128`，不支持 zero points 和 act-order。后续优先完善配置覆盖与错误提示。
-- **硬件选择条件需要收紧。**当前允许 sm75+ 设备选中该内核，后续应限制目标架构或引入性能判断，避免影响更新 GPU 的内核选择。
-- **大批量路径存在额外成本。**M>8 每次调用都会反量化并生成完整 FP16 权重临时张量，需要评估其延迟和峰值显存。
-- **部分形状利用率不足。**每个 program 负责一个输出通道，N 较小时可能无法充分利用 GPU；非 2 的幂 M 还会产生 padding 拷贝。
-- **参数仍为启发式配置。**后续可根据形状调整 `BLOCK_K`、warp 数以及 GEMV 切换阈值。
-- **测试体系尚不完整。**目前缺少正式单元测试和端到端 benchmark，需要补充边界形状、TP 分片、数值误差及服务性能测试。
-
-数值方面，小批量路径采用 FP32 反量化与累加，但浮点乘法、累加和最终 FP16 写回仍可能产生舍入误差。它与“先反量化为 FP16 再调用 cuBLAS”的路径可能存在差异，不能仅凭累加 dtype 就保证所有情况下误差更小或完全一致。
-
-仓库地址已补充，README 对应部分可改为：
-
-### 环境搭建
-
 ```bash
-git clone https://github.com/lostwithin/vllm.git
-cd vllm
-
-# 按该分支的构建说明安装匹配的 PyTorch、CUDA 与 Triton。
-pip install -e .
+python check_w8a16_gemv.py
 ```
 
-### 核心改动文件
+This script displays numerical errors but does not define a pass threshold. Formal tests should cover different M, N, and K values and the M=8/9 path boundary. When calling the underlying function directly, ensure K is divisible by 128.
 
-- [triton_w8a16_gemv.py](https://github.com/lostwithin/vllm/blob/HEAD/vllm/model_executor/kernels/linear/mixed_precision/triton_w8a16_gemv.py)：W8A16 GEMV、权重转换与大批量回退。
-- [linear/__init__.py](https://github.com/lostwithin/vllm/blob/HEAD/vllm/model_executor/kernels/linear/__init__.py)：内核注册与选择优先级。
-- [mixed_precision/__init__.py](https://github.com/lostwithin/vllm/blob/HEAD/vllm/model_executor/kernels/linear/mixed_precision/__init__.py)：导出内核类。
+End-to-end validation should also compare runs with the kernel disabled and enabled using the same model, prompt, and sampling settings. Confirm the activation log and check outputs and performance. A single output comparison does not replace comprehensive numerical and task-quality evaluation.
 
-## 致谢
+## 5. Limitations and Future Work
 
-本项目基于 [vllm-project/vllm](https://github.com/vllm-project/vllm) 二次开发，上游采用 Apache License 2.0。感谢 vLLM、Triton 及相关开源社区提供的基础设施。
+### Known Limitations
 
-原版 README 归档位置：[`docs/UPSTREAM_README.md`](./docs/UPSTREAM_README.md)
+- **Limited configuration support.** Only `uint8b128`, FP16 activations, and `group_size=128` are supported. Zero points and act-order are unsupported.
+- **Broad hardware eligibility.** The current check allows sm75+ devices to select the kernel, which may affect kernel selection on newer GPUs when enabled.
+- **Large-batch overhead.** Every M>8 call dequantizes and materializes a full `[N, K]` temporary FP16 weight tensor.
+- **Underutilization for some shapes.** One program handles one output channel, so small N may underutilize the GPU. Non-power-of-two M requires an additional padding copy.
+- **Heuristic parameters.** `BLOCK_K` is selected by divisibility and `num_warps` is fixed at 4, without shape-specific autotuning.
+- **No alignment guard in the low-level interface.** If `K % 128 != 0`, `_pick_block_k()` returns 0 and may cause a launch failure. Normal kernel selection filters this configuration, but direct callers must validate it.
+- **Incomplete validation coverage.** End-to-end A/B results show approximately 10% higher decode throughput, but original records and test configuration details, formal unit tests, and a complete operator benchmark still need to be supplied.
+
+### Numerical Behavior
+
+The small-batch path uses FP32 dequantization and accumulation, then writes FP16 output. INT8-to-FP32 conversion itself is lossless, but floating-point arithmetic and the final FP16 conversion may introduce rounding errors.
+
+Results may differ from the path that first dequantizes to FP16 and then calls cuBLAS. The accumulator dtype alone does not guarantee lower error or identical results in every case. M≤8 and M>8 use different computation paths, so numerical behavior at the transition should be tested explicitly.
+
+### Future Work
+
+- [ ] Tighten target GPU architecture checks to avoid overriding other kernels on non-target devices.
+- [ ] Add numerical and boundary tests covering non-power-of-two M, M=8/9, different K values, and TP sharding.
+- [ ] Publish a complete benchmark script and per-shape latency measurements.
+- [ ] Publish absolute throughput, the original prompt, timing definition, aggregation method, and original script for the approximately 10% single-request decode throughput gain.
+- [ ] Extend testing to concurrent requests and measure TTFT, TPOT, and peak GPU memory.
+- [ ] Evaluate caching strategies for the large-batch dequantization path and their memory trade-offs.
+- [ ] Tune `BLOCK_K`, warp count, and the GEMV switching threshold based on measurements.
+
+## Acknowledgements
+
+[lostwithin/vllm](https://github.com/lostwithin/vllm) is based on [vllm-project/vllm](https://github.com/vllm-project/vllm), whose upstream code is licensed under Apache License 2.0. Thanks to the vLLM, Triton, and related open-source communities for the underlying infrastructure.
+
+The original README is archived at [`docs/UPSTREAM_README.md`](./docs/UPSTREAM_README.md).
+
